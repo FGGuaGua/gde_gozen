@@ -55,6 +55,7 @@ class AudioStreamFFmpeg : public AudioStream {
 	~AudioStreamFFmpeg();
 
 	int open(const String& path, int stream_index = -1);
+	int _open(const PackedByteArray& byte, int stream_index = -1,const String& path);
 	void close();
 	inline bool is_open() const { return loaded; }
 

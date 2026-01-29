@@ -17,8 +17,10 @@ AudioStreamFFmpeg::~AudioStreamFFmpeg() {
 	av_codec_ctx.reset();
 	av_format_ctx.reset();
 }
-
 int AudioStreamFFmpeg::open(const String& path, int stream_index) {
+	return AudioStreamFFmpeg::_open(PackedByteArray::new(),stream_index,path);
+}
+int AudioStreamFFmpeg::_open(const PackedByteArray& byte, int stream_index,const String& path) {
 	mutex = memnew(Mutex);
 	mutex->lock();
 	AVFormatContext* temp_format_ctx = nullptr;
@@ -31,7 +33,11 @@ int AudioStreamFFmpeg::open(const String& path, int stream_index) {
 
 	if (path.begins_with("res://") || path.begins_with("user://")) {
 		temp_format_ctx = avformat_alloc_context();
+		//if (Engine.is_editor_hint()) {
+		//	file_buffer = FileAccess::get_file_as_bytes(path);
+		//} else {
 		file_buffer = FileAccess::get_file_as_bytes(path);
+		//}
 
 		if (!temp_format_ctx) {
 			mutex->unlock();
@@ -451,6 +457,7 @@ bool AudioStreamFFmpegPlayback::fill_buffer() {
 
 void AudioStreamFFmpeg::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("open", "path", "stream_index"), &AudioStreamFFmpeg::open, DEFVAL(-1));
+	ClassDB::bind_method(D_METHOD("open_with_bytes", "bytes", "stream_index"), &AudioStreamFFmpeg::open_with_bytes, DEFVAL(-1));
 	ClassDB::bind_method(D_METHOD("__instantiate_playback"), &AudioStreamFFmpeg::_instantiate_playback);
 	ClassDB::bind_method(D_METHOD("set_use_icy", "value"), &AudioStreamFFmpeg::set_use_icy);
 	ClassDB::bind_method(D_METHOD("get_use_icy"), &AudioStreamFFmpeg::get_use_icy);
