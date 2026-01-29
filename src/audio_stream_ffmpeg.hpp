@@ -25,7 +25,7 @@ class AudioStreamFFmpeg : public AudioStream {
 	AVStream* av_stream = nullptr;
 
 	AVChannelLayout ch_layout;
-	BufferData buffer_data; // Used for res:// and user://
+	BufferData buffer_data; // Used for res://, user:// and memory buffer
 	PackedByteArray file_buffer;
 
 	bool loaded = false;
@@ -43,6 +43,7 @@ class AudioStreamFFmpeg : public AudioStream {
 	Mutex *mutex; // We need thread safety
 
 	String file_path;
+	bool from_memory_buffer = false; // Flag to indicate if loaded from memory buffer
 
 	static inline void _log(String message) { UtilityFunctions::print("GoZenAudioStream: ", message, "."); }
 	static inline bool _log_err(String message) {
@@ -55,7 +56,7 @@ class AudioStreamFFmpeg : public AudioStream {
 	~AudioStreamFFmpeg();
 
 	int open(const String& path, int stream_index = -1);
-	int _open(const PackedByteArray& byte, int stream_index = -1,const String& path);
+	int load_from_buffer(const PackedByteArray &data, int stream_index = -1);
 	void close();
 	inline bool is_open() const { return loaded; }
 
@@ -72,59 +73,7 @@ class AudioStreamFFmpeg : public AudioStream {
   protected:
 	static void _bind_methods();
 	friend class AudioStreamFFmpegPlayback;
-};
-
-class AudioStreamFFmpegPlayback : public AudioStreamPlaybackResampled {
-	GDCLASS(AudioStreamFFmpegPlayback, AudioStreamPlaybackResampled);
-
+	
   private:
-	const AudioStreamFFmpeg* audio_stream_ffmpeg = nullptr;
-	UniqueAVFrame av_frame;
-	UniqueAVFrame av_decoded_frame;
-	UniqueAVPacket av_packet;
-
-	struct sint16_stereo {
-		int16_t l;
-		int16_t r;
-	};
-
-	sint16_stereo* buffer = nullptr;
-	size_t buffer_len = 4410000 * 6; // ~1 minute
-	size_t buffer_fill = 0;			 // Number of samples current in buffer
-	bool is_playing = false;
-
-	uint32_t mixed = 0;
-	uint32_t mix_rate = 44100;
-	bool stereo = true;
-
-	Dictionary icy_headers;
-	String stream_title;
-
-  public:
-	AudioStreamFFmpegPlayback() {
-		buffer = new sint16_stereo[buffer_len];
-
-		if (!av_packet)
-			av_packet = make_unique_ffmpeg<AVPacket, AVPacketDeleter>(av_packet_alloc());
-		if (!av_frame)
-			av_frame = make_unique_ffmpeg<AVFrame, AVFrameDeleter>(av_frame_alloc());
-		if (!av_decoded_frame)
-			av_decoded_frame = make_unique_ffmpeg<AVFrame, AVFrameDeleter>(av_frame_alloc());
-	}
-	~AudioStreamFFmpegPlayback() override { delete[] buffer; }
-
-	bool fill_buffer();
-
-	void _start(double p_from_pos) override;
-	void _stop() override;
-	bool _is_playing() const override;
-	int32_t _get_loop_count() const override { return 0; }
-	double _get_playback_position() const override;
-	void _seek(double p_position) override;
-	int32_t _mix_resampled(AudioFrame* p_buffer, int32_t p_frames) override;
-	float _get_stream_sampling_rate() const override { return mix_rate; }
-
-  protected:
-	static inline void _bind_methods() {}
-	friend class AudioStreamFFmpeg;
+	int _open_from_memory(const PackedByteArray &data, int stream_index);
 };

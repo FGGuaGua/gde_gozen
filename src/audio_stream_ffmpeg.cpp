@@ -10,6 +10,7 @@ AudioStreamFFmpeg::~AudioStreamFFmpeg() {
 	memdelete(mutex);
 
 	loaded = false;
+	from_memory_buffer = false;
 	av_stream = nullptr;
 	file_buffer.clear();
 	avio_ctx.reset();
@@ -17,15 +18,61 @@ AudioStreamFFmpeg::~AudioStreamFFmpeg() {
 	av_codec_ctx.reset();
 	av_format_ctx.reset();
 }
-int AudioStreamFFmpeg::open(const String& path, int stream_index) {
-	return AudioStreamFFmpeg::_open(PackedByteArray::new(),stream_index,path);
+
+int AudioStreamFFmpeg::_open_from_memory(const PackedByteArray &data, int stream_index) {
+	AVFormatContext* temp_format_ctx = nullptr;
+	AVDictionary* options = nullptr;
+	
+	if (use_icy) {
+		av_dict_set(&options, "icy", "1", 0);
+	}
+
+	temp_format_ctx = avformat_alloc_context();
+	file_buffer = data; // Store the buffer
+
+	if (!temp_format_ctx) {
+		mutex->unlock();
+		return _log_err("Failed to allocate AVFormatContext");
+	} else if (file_buffer.is_empty()) {
+		avformat_free_context(temp_format_ctx);
+		mutex->unlock();
+		return _log_err("Buffer is empty");
+	}
+
+	buffer_data.ptr = file_buffer.ptrw();
+	buffer_data.size = file_buffer.size();
+	buffer_data.offset = 0;
+
+	const int IO_BUFFER_SIZE = 8 * 1024 * 1024; // 8 MB
+	unsigned char* avio_ctx_buffer = (unsigned char*)av_malloc(IO_BUFFER_SIZE);
+	avio_ctx = make_unique_ffmpeg<AVIOContext, AVIOContextDeleter>(
+		avio_alloc_context(avio_ctx_buffer, IO_BUFFER_SIZE, 0, &buffer_data, &FFmpeg::read_buffer_packet, nullptr,
+						   &FFmpeg::seek_buffer));
+
+	if (!avio_ctx) {
+		av_free(avio_ctx_buffer);
+		mutex->unlock();
+		return _log_err("Failed to create avio_ctx");
+	}
+
+	temp_format_ctx->pb = avio_ctx.get();
+
+	if (avformat_open_input(&temp_format_ctx, nullptr, nullptr, nullptr) != 0) {
+		mutex->unlock();
+		return _log_err("Failed to open input from memory buffer");
+	}
+
+	av_format_ctx = make_unique_ffmpeg<AVFormatContext, AVFormatCtxInputDeleter>(temp_format_ctx);
+	return 0;
 }
-int AudioStreamFFmpeg::_open(const PackedByteArray& byte, int stream_index,const String& path) {
+
+int AudioStreamFFmpeg::open(const String& path, int stream_index) {
 	mutex = memnew(Mutex);
 	mutex->lock();
 	AVFormatContext* temp_format_ctx = nullptr;
 	AVDictionary* options = nullptr;
 	file_path = path;
+	from_memory_buffer = false;
 	
 	if (use_icy) {
 		av_dict_set(&options, "icy", "1", 0);
@@ -33,11 +80,7 @@ int AudioStreamFFmpeg::_open(const PackedByteArray& byte, int stream_index,const
 
 	if (path.begins_with("res://") || path.begins_with("user://")) {
 		temp_format_ctx = avformat_alloc_context();
-		//if (Engine.is_editor_hint()) {
-		//	file_buffer = FileAccess::get_file_as_bytes(path);
-		//} else {
 		file_buffer = FileAccess::get_file_as_bytes(path);
-		//}
 
 		if (!temp_format_ctx) {
 			mutex->unlock();
@@ -76,6 +119,114 @@ int AudioStreamFFmpeg::_open(const PackedByteArray& byte, int stream_index,const
 	}
 
 	av_format_ctx = make_unique_ffmpeg<AVFormatContext, AVFormatCtxInputDeleter>(temp_format_ctx);
+	if (avformat_find_stream_info(av_format_ctx.get(), NULL)) {
+		mutex->unlock();
+		return _log_err("Couldn't find stream info");
+	}
+
+	if (stream_index == -1) {
+		for (int i = 0; i < av_format_ctx->nb_streams; i++) {
+			AVCodecParameters* params = av_format_ctx->streams[i]->codecpar;
+
+			if (params->codec_type == AVMEDIA_TYPE_AUDIO) {
+				av_stream = av_format_ctx->streams[i];
+				break;
+			}
+		}
+	} else if (stream_index >= 0 && stream_index < av_format_ctx->nb_streams) {
+		AVCodecParameters* av_codec_params = av_format_ctx->streams[stream_index]->codecpar;
+
+		if (av_codec_params->codec_type == AVMEDIA_TYPE_AUDIO)
+			av_stream = av_format_ctx->streams[stream_index];
+	} else {
+		mutex->unlock();
+		return _log_err("Invalid stream index");
+	}
+
+	if (!av_stream) {
+		mutex->unlock();
+		return _log_err("No audio stream found");
+	}
+
+	// Getting the length (average).
+	if (av_stream->duration != AV_NOPTS_VALUE) {
+		length = av_stream->duration * av_q2d(av_stream->time_base);
+	} else if (av_format_ctx->duration != AV_NOPTS_VALUE) {
+		length = av_format_ctx->duration / (double)AV_TIME_BASE;
+	}
+
+	// Discard all non-audio streams.
+	for (int i = 0; i < av_format_ctx->nb_streams; i++) {
+		AVCodecParameters* av_codec_params = av_format_ctx->streams[i]->codecpar;
+
+		if (!avcodec_find_decoder(av_codec_params->codec_id)) {
+			if (i != stream_index)
+				av_format_ctx->streams[i]->discard = AVDISCARD_ALL;
+		}
+	}
+
+	if (!av_stream) {
+		mutex->unlock();
+		return _log_err("No audio stream found");
+	}
+
+	const AVCodec* codec = avcodec_find_decoder(av_stream->codecpar->codec_id);
+	if (!codec) {
+		mutex->unlock();
+		return _log_err("Couldn't find decoder");
+	}
+
+	av_codec_ctx = make_unique_ffmpeg<AVCodecContext, AVCodecCtxDeleter>(avcodec_alloc_context3(codec));
+	if (!av_codec_ctx) {
+		mutex->unlock();
+		return _log_err("Couldn't allocate codec context");
+	} else if (avcodec_parameters_to_context(av_codec_ctx.get(), av_stream->codecpar)) {
+		mutex->unlock();
+		return _log_err("Couldn't initialize codec context");
+	}
+
+	av_codec_ctx->request_sample_fmt = AV_SAMPLE_FMT_S16;
+	if (avcodec_open2(av_codec_ctx.get(), codec, nullptr)) {
+		mutex->unlock();
+		return _log_err("Couldn't open audio codec");
+	}
+
+	stereo = av_codec_ctx->ch_layout.nb_channels >= 2;
+	ch_layout = av_codec_ctx->ch_layout;
+	sample_rate = av_codec_ctx->sample_rate;
+	bytes_per_sample = av_get_bytes_per_sample(AV_SAMPLE_FMT_S16);
+
+	AVChannelLayout out_ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
+
+	SwrContext* temp_swr_ctx = nullptr;
+	int response = swr_alloc_set_opts2(&temp_swr_ctx, &out_ch_layout, AV_SAMPLE_FMT_S16, sample_rate,
+									   &av_codec_ctx->ch_layout, av_codec_ctx->sample_fmt, sample_rate, 0, nullptr);
+	swr_ctx = make_unique_ffmpeg<SwrContext, SwrCtxDeleter>(temp_swr_ctx);
+	if (response < 0 || swr_init(swr_ctx.get()) < 0) {
+		mutex->unlock();
+		return _log_err("Failed to initialize SWR");
+	}
+
+	loaded = true;
+	mutex->unlock();
+	return 0;
+}
+
+int AudioStreamFFmpeg::load_from_buffer(const PackedByteArray &data, int stream_index) {
+	mutex = memnew(Mutex);
+	mutex->lock();
+	
+	file_path = "memory_buffer";
+	from_memory_buffer = true;
+	
+	// Call the internal memory loading function
+	int result = _open_from_memory(data, stream_index);
+	if (result != 0) {
+		mutex->unlock();
+		return result;
+	}
+	
+	// The rest of the initialization is the same as open()
 	if (avformat_find_stream_info(av_format_ctx.get(), NULL)) {
 		mutex->unlock();
 		return _log_err("Couldn't find stream info");
@@ -457,7 +608,7 @@ bool AudioStreamFFmpegPlayback::fill_buffer() {
 
 void AudioStreamFFmpeg::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("open", "path", "stream_index"), &AudioStreamFFmpeg::open, DEFVAL(-1));
-	ClassDB::bind_method(D_METHOD("open_with_bytes", "bytes", "stream_index"), &AudioStreamFFmpeg::open_with_bytes, DEFVAL(-1));
+	ClassDB::bind_method(D_METHOD("load_from_buffer", "data", "stream_index"), &AudioStreamFFmpeg::load_from_buffer, DEFVAL(-1));
 	ClassDB::bind_method(D_METHOD("__instantiate_playback"), &AudioStreamFFmpeg::_instantiate_playback);
 	ClassDB::bind_method(D_METHOD("set_use_icy", "value"), &AudioStreamFFmpeg::set_use_icy);
 	ClassDB::bind_method(D_METHOD("get_use_icy"), &AudioStreamFFmpeg::get_use_icy);
